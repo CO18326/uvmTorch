@@ -22,13 +22,119 @@ import os
 import csv
 import argparse
 import re
+import logging
+#--------------------------------------------------Memory------------------------------------------------------
+def human_readable_mb(x_bytes):
+    mb = x_bytes / (1024 ** 2)
+    return f"{mb:,.1f} MB / {mb/1024:.3f} GB"
 
+def predict_peak_memory(model, batch_size, seq_len, bf16=True, extra_safety=1.0):
+    """
+    Predict a conservative GPU memory peak (bytes) assuming bf16 (2 bytes per element).
+    - model: HF model object (to read config and parameter count)
+    - batch_size, seq_len: ints
+    - extra_safety: multiplicative safety factor for activations/temps (>=1.0)
+    Returns a dict of components in bytes.
+    """
+    # element size
+    if bf16:
+        elem_bytes = 2
+    else:
+        elem_bytes = 4  # fp32
+
+    # total params (number)
+    try:
+        total_params = sum(p.numel() for p in model.parameters())
+    except Exception:
+        # fallback to config if parameters not yet loaded
+        total_params = getattr(model.config, "n_parameters", None) or 0
+
+    # param memory (model weights)
+    param_bytes = int(total_params * elem_bytes)
+
+    # gradients stored in same dtype as params in your setup (bf16), so approx same size
+    grad_bytes = param_bytes
+
+    # optimizer states: conservative default 2x parameter memory (e.g., Adam-like: m/v)
+    optim_state_factor = 2.0
+    optim_bytes = int(param_bytes * optim_state_factor)
+
+    # try to get shape info from model config
+    cfg = getattr(model, "config", None)
+    hidden_size = None
+    num_layers = None
+    if cfg is not None:
+        hidden_size = getattr(cfg, "hidden_size", None) or getattr(cfg, "n_embd", None) or getattr(cfg, "d_model", None)
+        num_layers = getattr(cfg, "n_layer", None) or getattr(cfg, "num_hidden_layers", None) or getattr(cfg, "n_layer", None)
+
+    # fallback guesses if not available
+    if hidden_size is None:
+        # try to infer from parameter shapes
+        for n, p in model.named_parameters():
+            if "embed" in n and p.ndim == 2:
+                hidden_size = p.shape[1]
+                break
+    if hidden_size is None:
+        hidden_size = 2048  # safe default
+
+    if num_layers is None:
+        # try to infer number of transformer blocks from modules
+        try:
+            num_layers = sum(1 for m in model.modules() if m.__class__.__name__.lower().startswith("transformer") or m.__class__.__name__.lower().startswith("block"))
+            if num_layers == 0:
+                num_layers = getattr(cfg, "n_layer", None) or 24
+        except Exception:
+            num_layers = 24
+
+    # Activation estimate:
+    # conservative formula: activations ~ batch * seq_len * hidden_size * num_layers * elem_bytes
+    # plus extra for attention caches / intermediate buffers; multiply by activation_overhead_factor
+    activation_base = int(batch_size * seq_len * hidden_size * num_layers * elem_bytes)
+
+    # Add attention / softmax / intermediate buffers estimate: ~0.5x to 2.0x depending on model
+    activation_overhead_factor = 1.5
+
+    activation_bytes = int(activation_base * activation_overhead_factor * extra_safety)
+
+    # working/other overhead (10% of total params+grads+optim+activations)
+    other_overhead = int(0.10 * (param_bytes + grad_bytes + optim_bytes + activation_bytes))
+
+    total_bytes = param_bytes + grad_bytes + optim_bytes + activation_bytes + other_overhead
+
+    return {
+        "total_params": total_params,
+        "param_bytes": param_bytes,
+        "grad_bytes": grad_bytes,
+        "optim_bytes": optim_bytes,
+        "activation_bytes": activation_bytes,
+        "other_overhead": other_overhead,
+        "total_bytes": total_bytes,
+        "hidden_size": hidden_size,
+        "num_layers": num_layers,
+        "elem_bytes": elem_bytes
+    }
+
+def print_memory_prediction(model, batch_size, seq_len, bf16=True, safety=1.5):
+    d = predict_peak_memory(model, batch_size, seq_len, bf16=bf16, extra_safety=safety)
+    print("\n=== MEMORY PREDICTION (bf16) ===")
+    print(f"Model name: {getattr(model, 'name_or_path', getattr(model, '__class__', type(model)).__name__)}")
+    print(f"Total params: {d['total_params']:,}  (approx)")
+    print(f"Param memory (bf16): {human_readable_mb(d['param_bytes'])}")
+    print(f"Gradient memory (bf16, approx): {human_readable_mb(d['grad_bytes'])}")
+    print(f"Optimizer states (bf16, assumed 2x): {human_readable_mb(d['optim_bytes'])}")
+    print(f"Activation estimate (batch={batch_size}, seq_len={seq_len}, hidden={d['hidden_size']}, layers={d['num_layers']}): {human_readable_mb(d['activation_bytes'])}")
+    print(f"Working overhead (~10%): {human_readable_mb(d['other_overhead'])}")
+    print("-" * 46)
+    print(f"Estimated TOTAL memory (all on GPU, bf16): {human_readable_mb(d['total_bytes'])}")
+    print(f"Estimated GPU peak (opt states on GPU): {human_readable_mb(d['total_bytes'])}")
+    print("=== END PREDICTION ===\n")
+#--------------------------------------------------Memory prediction end---------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(description="CUDA Prefetch Trainer Script")
 
     parser.add_argument("--model_name", type=str,
-                        default="EleutherAI/gpt-neo-1.3B",
+                        default="ibm-granite/granite-3.0-8b-base",
                         help="Model name or path to load")
 
     parser.add_argument("--seq_len", type=int,
@@ -40,11 +146,11 @@ def parse_args():
                         help="Max training steps")
 
     parser.add_argument("--batch_size", type=int,
-                        default=2,
+                        default=1,
                         help="Per-device batch size")
 
     parser.add_argument("--prefetch_layers", type=int,
-                        default=5,
+                        default=1,
                         help="PREFETCH_LAYERS_AHEAD value")
 
     parser.add_argument("--optimisation", type=int,
@@ -81,6 +187,15 @@ def parse_args():
         "--activation_prefetch", type=int,
                          default=0,
                          help="1->activation_prefetch")
+    parser.add_argument(
+        "--logging", type=int,
+                         default=0,
+                         help="1->enable logger")
+    
+    parser.add_argument(
+        "--backward_prefetch", type=int,
+        default=0,help="1->backward prefetch"
+    )
 
 
     return parser.parse_args()
@@ -99,9 +214,46 @@ try:
 except Exception:
     pass
 
+weight_logger=None 
+input_logger=None
+optimizer_logger=None
+gradient_logger=None
 # ---------------- Config ----------------
-PREFETCH_LAYERS_AHEAD = 4
-streams = [torch.cuda.Stream().cuda_stream for _ in range(PREFETCH_LAYERS_AHEAD + 3)]
+streams=None
+PREFETCH_LAYERS_AHEAD=1
+#---------------------------------------------------------------------------------------------
+def create_loggers(log_dir="logs_allocation_flexible"):
+    global weight_logger
+    global input_logger
+    global optimizer_logger
+    global gradient_logger
+    os.makedirs(log_dir, exist_ok=True)
+
+    def make_logger(name, filename):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+
+        file_handler = logging.FileHandler(os.path.join(log_dir, filename))
+        file_handler.setLevel(logging.INFO)
+
+        formatter = logging.Formatter('%(message)s')
+        file_handler.setFormatter(formatter)
+
+        logger.addHandler(file_handler)
+        return logger
+
+    weight_logger = make_logger("weight_logger", "weight.txt")
+    input_logger = make_logger("input_logger", "input.txt")
+    optimizer_logger = make_logger("optimizer_logger", "optimizer.txt")
+    gradient_logger = make_logger("gradient_logger", "gradient.txt")
+
+    return weight_logger, input_logger, optimizer_logger, gradient_logger
+
+
+
+#----------------------------------------------------------------------------------------
+
+
 
 def extract_num(s):
     m = re.search(r'\.(\d+)\.', s)
@@ -243,9 +395,10 @@ def prefetch_params(module):
 def add_pre_backward_hook(module):
     def fw_hook(mod, inp, out):
         saved_refs = [weakref.ref(x) for x in inp if torch.is_tensor(x)]
-
+        
         def _make_hook(mod_ref, saved_refs):
             def _hook(grad):
+                prefetch_params(mod_ref)
                 for ref in saved_refs:
                     act = ref()
                     if act is None:
@@ -255,12 +408,12 @@ def add_pre_backward_hook(module):
             return _hook
 
         if torch.is_tensor(out) and out.requires_grad:
-            print("check....")
+            #print("check....")
             out.register_hook(_make_hook(mod, saved_refs))
         elif isinstance(out, tuple):
             for o in out:
                 if torch.is_tensor(o) and o.requires_grad:
-                    print("check....")
+                    #print("check....")
                     o.register_hook(_make_hook(mod, saved_refs))
 
     module.register_forward_hook(fw_hook)
@@ -288,21 +441,76 @@ class StepTimeCallback(TrainerCallback):
         with _offload_lock:
             _offloaded_bytes = 0
 
-def register_multi_layer_hooks(model,prefetch_weights=False, N=PREFETCH_LAYERS_AHEAD):
+def log_optimizer_state_addresses(optimizer):
+    for param_group in optimizer.param_groups:
+        for param in param_group['params']:
+            state = optimizer.state[param]
+            for key, value in state.items():
+               optimizer_logger.info(f"Optimizer State: {key}, Address: {hex(value.data_ptr())}, Size: {value.nelement() * value.element_size()}")
+
+class OptStateLoggerCallback(TrainerCallback):
+    def __init__(self):
+        self.trainer_ref = None
+        self.optimizer_ref =None
+    
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        global model_modules
+        if state.global_step==1:
+            for i,module  in enumerate(model_modules):
+                if hasattr(module, "weight"):
+                    p=module.weight
+                    if p.grad is not None:
+                        gradient_logger.info(f"Module: {p.__class__.__name__}, InputGradient {1} Address: {hex(p.grad.data_ptr())}, Size: {p.grad.nelement() * p.grad.element_size()}")
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        global model_modules
+        trainer = self.trainer_ref
+        opt= trainer.optimizer
+        if state.global_step==1:
+            log_optimizer_state_addresses(opt)
+            
+
+
+def register_multi_layer_hooks(model,prefetch_weights=False, N=1):
     global model_modules
+    #model.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total)) if prefetch_weights else model.register_forward_pre_hook(partial(hook_only_act, layer_idx=i, total_layers=total))
     model_modules = list(model.modules())
+    model_modules=[m for m in model_modules if hasattr(m, "weight") ]
     total = len(model_modules)
     for i, module in enumerate(model_modules):
         module.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total)) if prefetch_weights else module.register_forward_pre_hook(partial(hook_only_act, layer_idx=i, total_layers=total))
+        
+
+def register_backward_hook(model):
+    global model_modules
+    model_modules = list(model.modules())
+    total = len(model_modules)
+    #add_pre_backward_hook(model)
+    for i, module in enumerate(model_modules):
+        add_pre_backward_hook(module)
+
+def log_model_weight(model):
+    global weight_logger
+    global model_modules
+    model_modules = list(model.modules())
+    for i, module in enumerate(model_modules):
+        if hasattr(module, "weight"):
+            data_ptr = module.weight.data_ptr()
+            size_in_bytes = module.weight.nelement() * module.weight.element_size()
+            weight_logger.info(f"Address: {hex(data_ptr)}, Size: {size_in_bytes}")
+
+        
 
 
 def main():
     args = parse_args()
-
+    global streams
     global PREFETCH_LAYERS_AHEAD
     PREFETCH_LAYERS_AHEAD = args.prefetch_layers
-
+    streams = [torch.cuda.Stream().cuda_stream for _ in range(PREFETCH_LAYERS_AHEAD + 3)]
     global _offloaded_bytes
+
+    
 
     #model_name = "ibm-granite/granite-3.0-8b-base"
     model_name = args.model_name
@@ -312,12 +520,17 @@ def main():
     optimisation= args.optimisation
     prefetching = args.prefetching
     activation_prefetch = args.activation_prefetch
+    logging=args.logging
+    backward_prefetch=args.backward_prefetch
 
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     dataset = load_dataset("wikitext", "wikitext-2-v1", split="train")
 
+    if logging:
+        create_loggers()
+    
     def tokenize_fn(examples):
         model_inputs = tokenizer(
             examples["text"],
@@ -343,9 +556,14 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.bfloat16,
         ).cuda()
-
+    
+    print_memory_prediction(model, batch_size, seq_len, bf16=True, safety=1.5)
+    if logging:
+        log_model_weight(model)
     if prefetching:
-        register_multi_layer_hooks(model,True)
+        register_multi_layer_hooks(model,True,PREFETCH_LAYERS_AHEAD)
+    if backward_prefetch:
+        register_backward_hook(model)
     if activation_prefetch:
         register_multi_layer_hooks(model,False)
     if optimisation==2:
@@ -367,18 +585,23 @@ def main():
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_training_steps=20, num_warmup_steps=2
     )
+
+    callbacks=[StepTimeCallback(),OptStateLoggerCallback() ] if logging else [StepTimeCallback()]
     if args.optimiser_prefetch:
         
         optimizer=CustomAdamW(model.parameters(), lr=1e-5)
+        
+        
         trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=dataset,
             tokenizer=tokenizer,
             data_collator=data_collator,
-            callbacks=[StepTimeCallback()],
+            callbacks=callbacks,
             optimizers=(optimizer, scheduler),
         )
+        
 
     elif args.optimiser_offload:
         
@@ -388,7 +611,7 @@ def main():
             train_dataset=dataset,
             tokenizer=tokenizer,
             data_collator=data_collator,
-            callbacks=[StepTimeCallback()],
+            callbacks=callbacks,
             optimizers=(optimizer, None),
         )
     
@@ -400,8 +623,12 @@ def main():
             train_dataset=dataset,
             tokenizer=tokenizer,
             data_collator=data_collator,
-            callbacks=[StepTimeCallback()],
+            callbacks=callbacks,
+        
         )
+
+    if len(callbacks)>1:
+            callbacks[1].trainer_ref=trainer
 
     def pack_hook(tensor):
         global _offloaded_bytes
@@ -410,6 +637,8 @@ def main():
         size = _size_in_bytes(tensor)
         if not tensor.is_cuda:
             return tensor
+        if logging:
+            input_logger.info(f"Module: INPUT LOG, Input {0} Address: {hex(tensor.data_ptr())}, Size: {tensor.nelement() * tensor.element_size()}")
 
         with _offload_lock:
             remaining = args.act_mem_pinned*1024 * (1024 ** 2) - _offloaded_bytes
@@ -423,6 +652,8 @@ def main():
                 return tensor
 
     def pack_hook_layer(tensor):
+        if logging:
+            input_logger.info(f"Module: INPUT LOG, Input {0} Address: {hex(tensor.data_ptr())}, Size: {tensor.nelement() * tensor.element_size()}")
         if not should_offload(tensor):
             return tensor
         #print("inside the pack hook:",id(tensor))
@@ -432,6 +663,11 @@ def main():
         torch._C._cuda_beginUvmAllocate()
 
         return packed
+    
+    def pack_hook_logging(tensor):
+        if logging:
+            input_logger.info(f"Module: INPUT LOG, Input {0} Address: {hex(tensor.data_ptr())}, Size: {tensor.nelement() * tensor.element_size()}")
+        return tensor
 
 
     def unpack_hook(packed):
@@ -446,10 +682,12 @@ def main():
         with torch.autograd.graph.saved_tensors_hooks(pack_hook_layer, unpack_hook):
             trainer.train()
     else:
-        trainer.train()
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook_logging, unpack_hook):
+            trainer.train()
 
 
 if __name__ == "__main__":
     torch._C._cuda_beginUvmAllocate()
     main()
+    #my_lib.print_first_byte()
     torch._C._cuda_endUvmAllocate()
