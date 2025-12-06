@@ -79,5 +79,19 @@ int print_first_byte() {
     return 0;
 }
 
+int cuda_malloc(unsigned long size_in_gb){
+
+void* b;
+
+cudaMalloc(&b,size_in_gb*(1024*1024*1024));
+
+return 0;
 
 }
+
+
+
+}
+
+
+

@@ -26,7 +26,7 @@ import logging
 #--------------------------------------------------Memory------------------------------------------------------
 def human_readable_mb(x_bytes):
     mb = x_bytes / (1024 ** 2)
-    return f"{mb:,.1f} MB / {mb/1024:.3f} GB"
+    return f"{mb:.2f}"
 
 def predict_peak_memory(model, batch_size, seq_len, bf16=True, extra_safety=1.0):
     """
@@ -134,7 +134,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="CUDA Prefetch Trainer Script")
 
     parser.add_argument("--model_name", type=str,
-                        default="ibm-granite/granite-3.0-8b-base",
+                        default="EleutherAI/gpt-neo-2.7B",
                         help="Model name or path to load")
 
     parser.add_argument("--seq_len", type=int,
@@ -197,6 +197,16 @@ def parse_args():
         default=0,help="1->backward prefetch"
     )
 
+    parser.add_argument(
+        "--oversubscription_factor",type=float,
+        default=0,help="oversubscription factor you want to enforce"
+    )
+    
+    parser.add_argument(
+        "--build_csv",type=float,
+        default=0,help="building the csv"
+    )
+
 
     return parser.parse_args()
 
@@ -209,6 +219,8 @@ my_lib.pin_memory_hint.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int]
 my_lib.pin_memory_hint.restype = ctypes.c_int
 my_lib.prefetch_memory_batch.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p]
 my_lib.prefetch_memory_batch.restype = ctypes.c_int
+my_lib.cuda_malloc.argtypes=[ctypes.c_ulong]
+my_lib.cuda_malloc.restype=ctypes.c_int
 try:
     my_lib.print_first_byte.restype = ctypes.c_int
 except Exception:
@@ -429,13 +441,17 @@ def _size_in_bytes(tensor):
 class StepTimeCallback(TrainerCallback):
     def __init__(self):
         self.start = None
+        self.step_times = []
+        self.peak_mems = []
     def on_step_begin(self, args, state, control, **kwargs):
         self.start = time.time()
     def on_step_end(self, args, state, control, **kwargs):
         global _offloaded_bytes
         torch.cuda.synchronize()
         duration = time.time() - self.start
-        max_mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        self.step_times.append(duration)
+        max_mem = torch.cuda.max_memory_reserved() / (1024 ** 2)
+        self.peak_mems.append(max_mem)
         print(f"[Step {state.global_step}] {duration:.3f} sec | Max GPU Mem: {max_mem:.2f} MB")
         torch.cuda.reset_peak_memory_stats()
         with _offload_lock:
@@ -557,7 +573,7 @@ def main():
             model_name, torch_dtype=torch.bfloat16,
         ).cuda()
     
-    print_memory_prediction(model, batch_size, seq_len, bf16=True, safety=1.5)
+    #print_memory_prediction(model, batch_size, seq_len, bf16=True, safety=1.5)
     if logging:
         log_model_weight(model)
     if prefetching:
@@ -569,6 +585,84 @@ def main():
     if optimisation==2:
         attach_hooks_by_type(model,args.num_layer_pinned)
 
+    callbacks=[StepTimeCallback(),OptStateLoggerCallback() ] if logging else [StepTimeCallback()]
+    
+    training_args = TrainingArguments(
+        output_dir="./results",
+        per_device_train_batch_size=batch_size,
+        num_train_epochs=1,
+        max_steps=2,
+        bf16=True,
+        logging_dir="./logs",
+        logging_steps=1,
+        save_strategy="no",
+        report_to="none",
+    )
+
+    
+    trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            callbacks=[callbacks[0]],
+        
+        )
+    
+    trainer.train()
+
+
+    cb = callbacks[0]
+
+    avg_step = sum(cb.step_times) / len(cb.step_times)
+    peak_mem = max(cb.peak_mems)   # MB
+
+    free_memory, total_memory = torch.cuda.memory.mem_get_info()
+
+    achieved_oversubscription_factor=(peak_mem*1024*1024/total_memory)
+
+    print(f"ACHIEVED OVERSUBSCRIPTION FACTOR {achieved_oversubscription_factor:.2f}")
+        
+    final_oversubscription=achieved_oversubscription_factor
+    if args.oversubscription_factor and round(achieved_oversubscription_factor) > args.oversubscription_factor :
+        print("Given oversubscription factor can not be achieved") 
+    elif args.oversubscription_factor and round(achieved_oversubscription_factor) < args.oversubscription_factor:
+
+        needed_memory=(total_memory*args.oversubscription_factor)/(1024**3)
+        extra_memory_needed= int(needed_memory - peak_mem/(1024))
+        my_lib.cuda_malloc(extra_memory_needed)
+        final_oversubscription=args.oversubscription_factor
+
+
+
+
+        
+        # Model memory breakdown using existing function
+    pred = predict_peak_memory(model, batch_size, seq_len, bf16=True, extra_safety=1.0)
+
+    param_b = pred["param_bytes"]
+    grad_b  = pred["grad_bytes"]
+    optim_b = pred["optim_bytes"]
+
+    activation_b = (peak_mem * 1024**2) - (param_b + grad_b + optim_b)
+    activation_b = max(activation_b, 0)
+
+    print("\n================ WARMUP SUMMARY ================")
+    print(f"Average Step Time: {avg_step:.4f} sec")
+    print(f"Peak GPU Memory  : {peak_mem:.2f} MB")
+    print(f"Weights Memory   : {human_readable_mb(param_b)}")
+    print(f"Gradients Memory : {human_readable_mb(grad_b)}")
+    print(f"Optimizer Memory : {human_readable_mb(optim_b)}")
+    print(f"Activation Memory: {human_readable_mb(activation_b)}")
+    print("================================================\n")
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    
+    callbacks[0].step_times=[]
+    callbacks[0].peak_mems=[]
+    
     training_args = TrainingArguments(
         output_dir="./results",
         per_device_train_batch_size=batch_size,
@@ -586,7 +680,10 @@ def main():
         optimizer, num_training_steps=20, num_warmup_steps=2
     )
 
-    callbacks=[StepTimeCallback(),OptStateLoggerCallback() ] if logging else [StepTimeCallback()]
+    
+    
+    
+    
     if args.optimiser_prefetch:
         
         optimizer=CustomAdamW(model.parameters(), lr=1e-5)
@@ -673,7 +770,25 @@ def main():
     def unpack_hook(packed):
         return packed
 
+    def build_csv_name(args):
+        parts = []
+        for k, v in vars(args).items():
+            # None values को skip करें
+            if k == "oversubscription_factor":
+                continue
+            if v is None:
+                continue
 
+            # Lists / dicts / spaces को safe बना दें
+            if isinstance(v, (list, tuple, dict)):
+                v = str(v).replace(" ", "_").replace("/", "-")
+            else:
+                v = str(v).replace(" ", "_").replace("/", "-")
+
+            parts.append(f"{v}")
+        
+        filename = "-".join(parts) + ".csv"
+        return filename
     if optimisation==1 :
         print("check----12")
         with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
@@ -684,6 +799,47 @@ def main():
     else:
         with torch.autograd.graph.saved_tensors_hooks(pack_hook_logging, unpack_hook):
             trainer.train()
+    
+    cb = callbacks[0]
+
+    avg_step = sum(cb.step_times) / len(cb.step_times)
+    peak_mem = max(cb.peak_mems)   # MB
+
+        # Model memory breakdown using existing function
+    pred = predict_peak_memory(model, batch_size, seq_len, bf16=True, extra_safety=1.0)
+
+    param_b = pred["param_bytes"]
+    grad_b  = pred["grad_bytes"]
+    optim_b = pred["optim_bytes"]
+
+    activation_b = (peak_mem * 1024**2) - (param_b + grad_b + optim_b)
+    activation_b = max(activation_b, 0)
+
+    print("\n================ FINAL SUMMARY ================")
+    print(f"Average Step Time: {avg_step:.4f} sec")
+    print(f"Peak GPU Memory  : {peak_mem:.2f} MB")
+    print(f"Weights Memory   : {human_readable_mb(param_b)}")
+    print(f"Gradients Memory : {human_readable_mb(grad_b)}")
+    print(f"Optimizer Memory : {human_readable_mb(optim_b)}")
+    print(f"Activation Memory: {human_readable_mb(activation_b)}")
+    print(f"Oversubscription Factor: {final_oversubscription:.2f}")
+    print("================================================\n")
+
+    if args.build_csv :
+    
+        csv_name = build_csv_name(args)
+
+        header = "avg_step_time,peak_gpu_mem,weights_mem,grads_mem,opt_mem,activation_mem,oversub_factor\n"
+        row = f"{avg_step:.4f},{peak_mem:.2f},{human_readable_mb(param_b)},{human_readable_mb(grad_b)},{human_readable_mb(optim_b)},{human_readable_mb(activation_b)},{final_oversubscription:.2f}\n"
+
+        write_header = not os.path.exists(csv_name)
+
+        with open(csv_name, "a") as f:
+            if write_header:
+                f.write(header)
+            f.write(row)
+
+        print(f"\nSaved/updated CSV: {csv_name}\n")
 
 
 if __name__ == "__main__":
