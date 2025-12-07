@@ -625,9 +625,9 @@ def main():
     print(f"ACHIEVED OVERSUBSCRIPTION FACTOR {achieved_oversubscription_factor:.2f}")
         
     final_oversubscription=achieved_oversubscription_factor
-    if args.oversubscription_factor and round(achieved_oversubscription_factor) > args.oversubscription_factor :
+    if args.oversubscription_factor and round(achieved_oversubscription_factor,2) > args.oversubscription_factor :
         print("Given oversubscription factor can not be achieved") 
-    elif args.oversubscription_factor and round(achieved_oversubscription_factor) < args.oversubscription_factor:
+    elif args.oversubscription_factor and round(achieved_oversubscription_factor,2) < args.oversubscription_factor:
 
         needed_memory=(total_memory*args.oversubscription_factor)/(1024**3)
         extra_memory_needed= int(needed_memory - peak_mem/(1024))
