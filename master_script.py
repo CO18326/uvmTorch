@@ -41,7 +41,7 @@ def main():
             # skip the key and its value
             i += 2
             continue
-        fixed_args.append(args.fixed[i])
+        fixed_args.append("--"+args.fixed[i])
         i += 1
 
     # Run full grid

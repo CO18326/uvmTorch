@@ -217,8 +217,8 @@ my_lib.prefetch_memory.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
 my_lib.prefetch_memory.restype = ctypes.c_int
 my_lib.pin_memory_hint.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int]
 my_lib.pin_memory_hint.restype = ctypes.c_int
-my_lib.prefetch_memory_batch.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p]
-my_lib.prefetch_memory_batch.restype = ctypes.c_int
+#my_lib.prefetch_memory_batch.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p]
+#my_lib.prefetch_memory_batch.restype = ctypes.c_int
 my_lib.cuda_malloc.argtypes=[ctypes.c_ulong]
 my_lib.cuda_malloc.restype=ctypes.c_int
 try:
