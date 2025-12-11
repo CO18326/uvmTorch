@@ -23,6 +23,10 @@ import csv
 import argparse
 import re
 import logging
+
+import os
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 #--------------------------------------------------Memory------------------------------------------------------
 def human_readable_mb(x_bytes):
     mb = x_bytes / (1024 ** 2)
@@ -566,12 +570,12 @@ def main():
         torch._C._cuda_endUvmAllocate()
         model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.bfloat16,
-        ).cuda()
+        ).cuda(0)
         torch._C._cuda_beginUvmAllocate()
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.bfloat16,
-        ).cuda()
+        ).cuda(0)
     
     #print_memory_prediction(model, batch_size, seq_len, bf16=True, safety=1.5)
     if logging:
@@ -773,13 +777,10 @@ def main():
     def build_csv_name(args):
         parts = []
         for k, v in vars(args).items():
-            # None values को skip करें
             if k == "oversubscription_factor":
                 continue
             if v is None:
                 continue
-
-            # Lists / dicts / spaces को safe बना दें
             if isinstance(v, (list, tuple, dict)):
                 v = str(v).replace(" ", "_").replace("/", "-")
             else:
@@ -798,8 +799,11 @@ def main():
             trainer.train()
     else:
         with torch.autograd.graph.saved_tensors_hooks(pack_hook_logging, unpack_hook):
+            
             trainer.train()
-    
+            
+
+    #print("Training end")
     cb = callbacks[0]
 
     avg_step = sum(cb.step_times) / len(cb.step_times)
@@ -843,7 +847,9 @@ def main():
 
 
 if __name__ == "__main__":
+    
     torch._C._cuda_beginUvmAllocate()
+    torch.cuda.set_device('cuda:0')
     main()
     #my_lib.print_first_byte()
     torch._C._cuda_endUvmAllocate()
