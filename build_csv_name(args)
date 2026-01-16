@@ -1,0 +1,2 @@
+avg_step_time,peak_gpu_mem,peak_gpu_mem_pinned,weights_mem,grads_mem,opt_mem,activation_mem,oversub_factor,available_gpu_mem
+23.3711,66800.00,0.00,15584.63,15584.63,31169.27,4461.47,2.77,24112.25

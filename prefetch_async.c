@@ -10,12 +10,16 @@ int prefetch_memory(unsigned long ptr_val, unsigned long size_in_bytes, int devi
     void* ptr = (void*)ptr_val;
    // cudaStream_t stream1;
     cudaError_t err; 
+   cudaMemLocation location;
+   location.type=cudaMemLocationTypeDevice;
   // err = cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking);
    // cudaStreamSynchronize(stream);
     if(device_id==1){
-    err = cudaMemPrefetchAsync(ptr, size_in_bytes,0,stream);}
+    location.id=0;
+    err = cudaMemPrefetchAsync(ptr, size_in_bytes,location,0,stream);}
     else{
-   err = cudaMemPrefetchAsync(ptr, size_in_bytes,cudaCpuDeviceId);}
+   location.id=-1;
+   err = cudaMemPrefetchAsync(ptr, size_in_bytes,location,0);}
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaMemPrefetchAsync failed: %s\n", cudaGetErrorString(err));
     } else {
@@ -25,14 +29,49 @@ int prefetch_memory(unsigned long ptr_val, unsigned long size_in_bytes, int devi
 	return 0;
 }
 
+int prefetch_memory_batch(unsigned long ptr_val_arr, unsigned long size_in_bytes_arr, unsigned long count, int device_id, cudaStream_t stream) {
+    void** ptr_arr = (void**)ptr_val_arr;
+    unsigned long* size_arr = (unsigned long*)size_in_bytes_arr;
+    unsigned long location_indx[]={0};
+   // cudaStream_t stream1;
+    cudaError_t err; 
+   cudaMemLocation location;
+   location.type=cudaMemLocationTypeDevice;
+  // err = cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking);
+   // cudaStreamSynchronize(stream);
+    if(device_id==1){
+    location.id=0;
+    //err = cudaMemPrefetchAsync(ptr, size_in_bytes,location,0,stream);
+    cudaMemLocation locations[]={location};
+
+    err=cudaMemPrefetchBatchAsync(ptr_arr,size_arr,count,locations,location_indx,1,0,stream);
+    
+
+
+   }
+   /** else{
+   location.id=-1;
+   err = cudaMemPrefetchAsync(ptr, size_in_bytes,location,0);}
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemPrefetchAsync failed: %s\n", cudaGetErrorString(err));
+    } else {
+    // printf("error");
+    }*/
+
+	return 0;
+}
+
 
 int prefetch_memory_cpu(unsigned long ptr_val, unsigned long size_in_bytes, int device_id, cudaStream_t stream) {
     void* ptr = (void*)ptr_val;
     //cudaStream_t stream1;
     cudaError_t err; 
+    cudaMemLocation location;
+   location.type=cudaMemLocationTypeDevice;
    // err = cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking);
    // cudaStreamSynchronize(stream);
-    err = cudaMemPrefetchAsync(ptr, size_in_bytes,cudaCpuDeviceId);
+   location.id=-1;
+    err = cudaMemPrefetchAsync(ptr, size_in_bytes,location,0);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaMemPrefetchAsync failed: %s\n", cudaGetErrorString(err));
     } else {
@@ -44,7 +83,9 @@ int prefetch_memory_cpu(unsigned long ptr_val, unsigned long size_in_bytes, int 
 
 
 int pin_memory_hint(unsigned long ptr_val, size_t size, int device) {
-    
+    cudaMemLocation location;
+   location.type=cudaMemLocationTypeDevice;
+    location.id=-1;
 
    void* ptr = (void*)ptr_val;
     cudaError_t err;
@@ -52,14 +93,15 @@ int pin_memory_hint(unsigned long ptr_val, size_t size, int device) {
 
     // Set preferred location for the memory
 if(device==0){    
-err = cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);}
+err = cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation, location);}
 else{
-err = cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation, 1);
+location.id=0;
+err = cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation, location);
 
 
 }
-cudaMemAdvise(ptr, size, cudaMemAdviseSetAccessedBy, 0);
-
+location.id=0;
+cudaMemAdvise(ptr, size, cudaMemAdviseSetAccessedBy, location);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaMemAdviseSetPreferredLocation failed: %s\n", cudaGetErrorString(err));
         return -1;
@@ -74,10 +116,11 @@ int print_first_byte() {
     //unsigned char* ptr = (unsigned char*)address;
     int* a;
     cudaMallocManaged(&a,sizeof(int));
-   *a=1;
+    *a=1;
     //printf("Value at address %lx: 0x%02x\n", address, *ptr);
     return 0;
 }
+
 
 int cuda_malloc(unsigned long size_in_gb){
 
@@ -90,8 +133,6 @@ return 0;
 }
 
 
-
 }
-
 
 

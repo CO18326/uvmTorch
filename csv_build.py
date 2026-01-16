@@ -68,10 +68,10 @@ for filename in os.listdir(CSV_FOLDER):
 
         fixed_tail = parts[-15:]
 
-        '''if model_name != "ibm-granite-granite-3.0-8b-base":
+        if model_name != "ibm-granite-granite-3.0-2b-base":
             #print(model_name)
             #print("check")
-            continue'''
+            continue
         fixed_tail.append("1.0")
         fixed_tail[-2]="0"
         metadata = dict(zip(
@@ -81,10 +81,10 @@ for filename in os.listdir(CSV_FOLDER):
     else:
         model_name = "-".join(parts[:-16])
         fixed_tail = parts[-16:]
-        '''if model_name != "ibm-granite-granite-3.0-8b-base":
+        if model_name != "ibm-granite-granite-3.0-2b-base":
             #print(model_name)
             #print("check")
-            continue'''
+            continue
 
         metadata = dict(zip(
             FILENAME_COLUMNS,

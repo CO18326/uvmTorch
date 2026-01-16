@@ -482,6 +482,19 @@ class StepTimeCallback(TrainerCallback):
         self.step_times = []
         self.peak_mems = []
         self.peak_mems_pinned=[]
+    def on_optimizer_step(self, args, state, control, **kwargs):
+
+        torch.cuda.nvtx.range_pop()
+
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+
+        torch.cuda.nvtx.range_push("Optimizer Step")
+
+
+
+    
+    
     def on_step_begin(self, args, state, control, **kwargs):
         self.start = time.time()
     def on_step_end(self, args, state, control, **kwargs):
@@ -658,7 +671,7 @@ def main():
         attach_hooks_by_type(model,args.num_layer_pinned)
 
     callbacks=[StepTimeCallback(),OptStateLoggerCallback() ] if logging else [StepTimeCallback()]
-    training_args = TrainingArguments(
+    '''training_args = TrainingArguments(
         output_dir="./results",
         per_device_train_batch_size=batch_size,
         num_train_epochs=1,
@@ -730,7 +743,7 @@ def main():
     print(f"Optimizer Memory : {human_readable_mb(optim_b)}")
     print(f"Activation Memory: {human_readable_mb(activation_b)}")
     print("================================================\n")
-    
+    '''
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     
@@ -884,8 +897,8 @@ def main():
         # Model memory breakdown using existing function
     pred = predict_peak_memory(model, batch_size, seq_len, bf16=True, extra_safety=1.0)
 
-    #final_oversubscription=0
-    #final_gpu_mem=0
+    final_oversubscription=0
+    final_gpu_mem=0
 
 
 
@@ -909,7 +922,7 @@ def main():
 
     if args.build_csv :
     
-        csv_name = f"/modelops/priyanka/runtime_csvs/{build_csv_name(args)}"
+        csv_name = f"{build_csv_name(args)}"
 
         header = "avg_step_time,peak_gpu_mem,peak_gpu_mem_pinned,weights_mem,grads_mem,opt_mem,activation_mem,oversub_factor,available_gpu_mem\n"
         row = f"{avg_step:.4f},{peak_mem:.2f},{peak_mems_pinned:.2f},{human_readable_mb(param_b)},{human_readable_mb(grad_b)},{human_readable_mb(optim_b)},{human_readable_mb(activation_b)},{final_oversubscription:.2f},{final_gpu_mem:.2f}\n"
