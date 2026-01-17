@@ -210,6 +210,11 @@ def parse_args():
         "--prefetch_weights_only",type=float,
         default=0,help="prefetch weights only"
     )
+
+    parser.add_argument(
+        "--hf_token",type=str,
+        default="",help="hugging_face_token"
+    )
     
     parser.add_argument(
         "--build_csv",type=float,
@@ -629,7 +634,7 @@ def main():
     backward_prefetch=args.backward_prefetch
 
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name,token=args.hf_token)
     tokenizer.pad_token = tokenizer.eos_token
     dataset = load_dataset("wikitext", "wikitext-2-v1", split="train")
 
@@ -655,12 +660,12 @@ def main():
     if args.weight_pinned:
         torch._C._cuda_endUvmAllocate()
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16
+            model_name, torch_dtype=torch.bfloat16,token=args.hf_token
         ).cuda(0)
         torch._C._cuda_beginUvmAllocate()
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16
+            model_name, torch_dtype=torch.bfloat16,token=args.hf_token
         ).cuda(0)
     
     #print_memory_prediction(model, batch_size, seq_len, bf16=True, safety=1.5)
@@ -872,7 +877,7 @@ def main():
     def build_csv_name(args):
         parts = []
         for k, v in vars(args).items():
-            if k == "oversubscription_factor" or k=="no_warmup" or k=="nvtx_inject":
+            if k == "oversubscription_factor" or k=="no_warmup" or k=="nvtx_inject" or k=="hf_token":
                 continue
             if v is None:
                 continue
