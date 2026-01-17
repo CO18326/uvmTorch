@@ -225,6 +225,8 @@ def parse_args():
 
     parser.add_argument("--nvtx_inject",type=int,default=0,help="NVTX Inject")
 
+    parser.add_argument("--csv_directory",type=str,default=".",help="csv directory")
+
 
     return parser.parse_args()
 
@@ -877,7 +879,7 @@ def main():
     def build_csv_name(args):
         parts = []
         for k, v in vars(args).items():
-            if k == "oversubscription_factor" or k=="no_warmup" or k=="nvtx_inject" or k=="hf_token":
+            if k == "oversubscription_factor" or k=="no_warmup" or k=="nvtx_inject" or k=="hf_token" or k=="csv_directory":
                 continue
             if v is None:
                 continue
@@ -938,7 +940,7 @@ def main():
 
     if args.build_csv :
     
-        csv_name = f"{build_csv_name(args)}"
+        csv_name = f"{args.csv_directory}/{build_csv_name(args)}"
 
         header = "avg_step_time,peak_gpu_mem,peak_gpu_mem_pinned,weights_mem,grads_mem,opt_mem,activation_mem,oversub_factor,available_gpu_mem\n"
         row = f"{avg_step:.4f},{peak_mem:.2f},{peak_mems_pinned:.2f},{human_readable_mb(param_b)},{human_readable_mb(grad_b)},{human_readable_mb(optim_b)},{human_readable_mb(activation_b)},{final_oversubscription:.2f},{final_gpu_mem:.2f}\n"
