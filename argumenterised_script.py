@@ -490,12 +490,12 @@ class StepTimeCallback(TrainerCallback):
     
     
     def on_optimizer_step(self, args, state, control, **kwargs):
-        if is_nvtx:
+        if self.is_nvtx:
             torch.cuda.nvtx.range_pop()
 
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        if is_nvtx:
+        if self.is_nvtx:
             torch.cuda.nvtx.range_push("Optimizer Step")
 
 
