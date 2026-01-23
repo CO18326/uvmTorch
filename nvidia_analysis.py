@@ -82,7 +82,7 @@ def main(sqlite_file):
 
     total_memcpy_ns = sum(memcpy_by_kind.values())
 
-    cur.execute("SELECT start, end FROM NVTX_EVENTS")
+    cur.execute("SELECT start, end FROM NVTX_EVENTS where start is not NULL and end is not NULL and text='Optimizer Step'")
     cpu_intervals = cur.fetchall()
     cpu_compute_ns = sum(e - s for s, e in cpu_intervals)
 
