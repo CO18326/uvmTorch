@@ -1,4 +1,5 @@
 import torch
+import types
 import time
 from datasets import load_dataset
 from transformers import (
@@ -226,6 +227,8 @@ def parse_args():
     parser.add_argument("--nvtx_inject",type=int,default=0,help="NVTX Inject")
 
     parser.add_argument("--csv_directory",type=str,default=".",help="csv directory")
+
+    parser.add_argument("--gradient_checkpointing",type=int,default=0,help="gradient_checkpointing")
 
 
     return parser.parse_args()
@@ -497,13 +500,13 @@ class StepTimeCallback(TrainerCallback):
     
     
     def on_optimizer_step(self, args, state, control, **kwargs):
-        if self.is_nvtx:
+        if self.is_nvtx :
             torch.cuda.nvtx.range_pop()
 
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        if self.is_nvtx:
-            torch.cuda.nvtx.range_push("Optimizer Step")
+        if self.is_nvtx :
+            torch.cuda.nvtx.range_push(f"Step {state.global_step} - Optimizer")
 
 
 
@@ -685,7 +688,7 @@ def main():
         attach_hooks_by_type(model,args.num_layer_pinned)
     
     
-    is_nvtx=True if args.nvtx_inject and args.optimiser_offload else False
+    is_nvtx=True if args.nvtx_inject  else False
     callbacks=[StepTimeCallback(is_nvtx),OptStateLoggerCallback() ] if logging else [StepTimeCallback(is_nvtx)]
     
     
@@ -700,6 +703,7 @@ def main():
             logging_steps=1,
             save_strategy="no",
             report_to="none",
+            gradient_checkpointing=args.gradient_checkpointing
         )
 
         
@@ -779,6 +783,7 @@ def main():
         logging_steps=1,
         save_strategy="no",
         report_to="none",
+        gradient_checkpointing=args.gradient_checkpointing
     )
 
     optimizer = ds_opt(model.parameters(), lr=1e-5)
@@ -829,6 +834,27 @@ def main():
             callbacks=callbacks,
         
         )
+
+    def nvtx_training_step(self, model, inputs, num_items_in_batch=None):
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        with self.compute_loss_context_manager():
+            torch.cuda.nvtx.range_push(f"Step {self.state.global_step} - Forward")
+            loss = self.compute_loss(model, inputs)
+            torch.cuda.nvtx.range_pop()
+
+        # Backward pass
+        torch.cuda.nvtx.range_push(f"Step {self.state.global_step} - Backward")
+        self.accelerator.backward(loss)
+        torch.cuda.nvtx.range_pop()
+        #print("hello")
+        torch.cuda.synchronize()
+
+        return loss.detach() / self.args.gradient_accumulation_steps
+
+    if args.nvtx_inject:
+        trainer.training_step=types.MethodType(nvtx_training_step, trainer)
 
     if len(callbacks)>1:
             callbacks[1].trainer_ref=trainer
