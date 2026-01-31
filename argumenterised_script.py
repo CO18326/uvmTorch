@@ -214,7 +214,7 @@ def parse_args():
 
     parser.add_argument(
         "--hf_token",type=str,
-        default="",help="hugging_face_token"
+        default=None,help="hugging_face_token"
     )
     
     parser.add_argument(
