@@ -42,6 +42,7 @@ FILENAME_COLUMNS = [
     "logging",
     "backward_prefetch",
     "weight_prefetch",
+    "gradient_checkpointing",
     "build_csv",
 ]
 
@@ -56,22 +57,23 @@ for filename in os.listdir(CSV_FOLDER):
     
     name = filename[:-4]                 # strip ".csv"
     parts = name.split("-")
+    print(name)
 
-    if len(parts) < len(FILENAME_COLUMNS) and parts[-13]=="8":
+    if len(parts) < len(FILENAME_COLUMNS) and parts[-13]=="2":
         print(f"⚠️ Skipping malformed filename: {filename}")
         continue
 
     
-    if parts[-13]=="8":
+    if parts[-13]=="2":
 
         model_name = "-".join(parts[:-15])
 
         fixed_tail = parts[-15:]
 
-        '''if model_name != "ibm-granite-granite-3.0-8b-base":
+        if model_name != "microsoft-Phi-3.5-mini-instruct":
             #print(model_name)
             #print("check")
-            continue'''
+            continue
         fixed_tail.append("1.0")
         fixed_tail[-2]="0"
         metadata = dict(zip(
@@ -81,10 +83,10 @@ for filename in os.listdir(CSV_FOLDER):
     else:
         model_name = "-".join(parts[:-16])
         fixed_tail = parts[-16:]
-        '''if model_name != "ibm-granite-granite-3.0-8b-base":
+        #if model_name != "microsoft-Phi-3.5-mini-instruct":
             #print(model_name)
             #print("check")
-            continue'''
+        #continue
 
         metadata = dict(zip(
             FILENAME_COLUMNS,
