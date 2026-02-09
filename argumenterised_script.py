@@ -217,6 +217,8 @@ def parse_args():
         default=None,help="hugging_face_token"
     )
     
+    parser.add_argument("--gradient_checkpointing",type=int,default=0,help="gradient_checkpointing")
+    
     parser.add_argument(
         "--build_csv",type=float,
         default=0,help="building the csv"
@@ -228,7 +230,7 @@ def parse_args():
 
     parser.add_argument("--csv_directory",type=str,default=".",help="csv directory")
 
-    parser.add_argument("--gradient_checkpointing",type=int,default=0,help="gradient_checkpointing")
+    
 
 
     return parser.parse_args()
