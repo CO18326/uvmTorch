@@ -3,7 +3,7 @@ import pandas as pd
 
 
 CSV_FOLDER = "."     # folder containing all experiment CSVs
-MASTER_CSV = "graite-2B-gradient_checkpointing_a5000.csv"       # final combined CSV
+MASTER_CSV = "master.csv"       # final combined CSV
 
 
 '''FILENAME_COLUMNS = [
@@ -42,7 +42,6 @@ FILENAME_COLUMNS = [
     "logging",
     "backward_prefetch",
     "weight_prefetch",
-    "gradient_checkpointing",
     "build_csv",
 ]
 
@@ -57,23 +56,24 @@ for filename in os.listdir(CSV_FOLDER):
     
     name = filename[:-4]                 # strip ".csv"
     parts = name.split("-")
+    parts = parts[:-3] if parts[-1]=="False" else parts
     print(name)
 
-    if len(parts) < len(FILENAME_COLUMNS) and parts[-13]=="2":
+    if len(parts)< len(FILENAME_COLUMNS) :
         print(f"⚠️ Skipping malformed filename: {filename}")
         continue
 
     
-    if parts[-13]=="2":
+    if False:
 
         model_name = "-".join(parts[:-15])
 
         fixed_tail = parts[-15:]
 
-        #if model_name != "microsoft-Phi-3.5-mini-instruct":
+        if model_name != "microsoft-Phi-3.5-mini-instruct":
             #print(model_name)
             #print("check")
-        #    continue
+            continue
         fixed_tail.append("1.0")
         fixed_tail[-2]="0"
         metadata = dict(zip(
@@ -81,9 +81,13 @@ for filename in os.listdir(CSV_FOLDER):
             [model_name] + fixed_tail
         ))
     else:
-        model_name = "-".join(parts[:-17])
-        fixed_tail = parts[-17:]
+        print(parts)
+        model_name = "-".join(parts[:-16])
+        print(model_name)
+        model_name=model_name.split("_")[2] if "_" in model_name else model_name
+        fixed_tail = parts[-16:]
         if model_name != "ibm-granite-granite-3.0-2b-base":
+            print("continuing without print")
             #print(model_name)
             #print("check")
             continue
@@ -116,3 +120,11 @@ master_df = pd.concat(all_dfs, ignore_index=True, sort=False)
 master_df.to_csv(MASTER_CSV, index=False)
 
 print(f"✅ Master CSV successfully created: {MASTER_CSV}")
+
+
+
+
+
+
+
+

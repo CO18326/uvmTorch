@@ -11,7 +11,7 @@ from transformers import (
     TrainerCallback,
     get_linear_schedule_with_warmup
 )
-
+from experiment.index_tensor import DataInspectorMode
 from functools import partial
 import ctypes
 from torch.optim import AdamW
@@ -28,6 +28,7 @@ import logging
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
+mode=DataInspectorMode()
 #--------------------------------------------------Memory------------------------------------------------------
 def human_readable_mb(x_bytes):
     mb = x_bytes / (1024 ** 2)
@@ -585,6 +586,7 @@ class StepTimeCallback(TrainerCallback):
     
     
     def on_step_begin(self, args, state, control, **kwargs):
+        mode.set_step(state.global_step)
         self.start = time.time()
     def on_step_end(self, args, state, control, **kwargs):
         global _offloaded_bytes
@@ -593,17 +595,13 @@ class StepTimeCallback(TrainerCallback):
         self.step_times.append(duration)
         max_mem = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems.append(max_mem)
-        #torch._C._cuda_endUvmAllocate()
+        torch._C._cuda_endUvmAllocate()
         max_mem_pinned = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems_pinned.append(max_mem_pinned)
-        #torch._C._cuda_beginUvmAllocate()
+        torch._C._cuda_beginUvmAllocate()
         
         print(f"[Step {state.global_step}] {duration:.3f} sec | Max GPU Mem: {max_mem:.2f} MB | Max Pinned GPU Mem: {max_mem_pinned:.2f} MB" )
         torch.cuda.reset_peak_memory_stats()
-        
-        #if state.global_step==2:
-        #    torch._C._accelerator_disablePrefetch()
-        
         with _offload_lock:
             _offloaded_bytes = 0
 
@@ -875,13 +873,7 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.bfloat16,token=args.hf_token
         ).cuda(0)'''
-    
-    
-    optimisation= args.optimisation
-    prefetching = args.prefetching
-    activation_prefetch = args.activation_prefetch
-    logging=args.logging
-    backward_prefetch=args.backward_prefetch
+
     
     if logging:
         log_model_weight(model)
@@ -1052,9 +1044,12 @@ def main():
         with torch.autograd.graph.saved_tensors_hooks(pack_hook_layer, unpack_hook):
             trainer.train()
     else:
-        with torch.autograd.graph.saved_tensors_hooks(pack_hook_logging, unpack_hook):
-            
-            trainer.train()
+        
+        
+        with mode:
+            with torch.autograd.graph.saved_tensors_hooks(pack_hook_logging, unpack_hook):
+                   
+                trainer.train()
             
 
     #print("Training end")
@@ -1110,7 +1105,6 @@ def main():
 if __name__ == "__main__":
     
     torch._C._cuda_beginUvmAllocate()
-    #torch._C._accelerator_enablePrefetch()
     torch.cuda.set_device('cuda:0')
     main()
     my_lib.print_first_byte()

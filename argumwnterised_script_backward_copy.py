@@ -11,7 +11,7 @@ from transformers import (
     TrainerCallback,
     get_linear_schedule_with_warmup
 )
-
+from backward_prefetch import _pre_backward_module_hook
 from functools import partial
 import ctypes
 from torch.optim import AdamW
@@ -408,7 +408,9 @@ class CustomAdamW(AdamW):
 def _prefetch_tensor_bytes(data_ptr, size_in_bytes, stream_idx):
     if size_in_bytes <= 0:
         return
-    my_lib.prefetch_memory(data_ptr, size_in_bytes, 1, ctypes.c_void_p(streams[stream_idx % len(streams)]))
+    #torch.cuda.Stream().cuda_stream
+    my_lib.prefetch_memory(data_ptr, size_in_bytes, 1, ctypes.c_void_p(streams[stream_idx % len(streams)].cuda_stream))
+    #my_lib.prefetch_memory(data_ptr, size_in_bytes, 1, ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
 
 def prefetch_tensor_if_large(tensor, stream_idx=1, threshold_bytes=2 * 1024 * 1024):
     if tensor is None or not torch.is_tensor(tensor):
@@ -455,11 +457,82 @@ def attach_hooks_by_type(model,num_layer):
 
 
 
+def _run_before_backward_function(sub_module,layer_idx,total_layers,outputs):
+    global streams
+    #global output_modules
+    if True:
+        #print("hello")
+        '''for inp in inputs:
+            if torch.is_tensor(inp):
+                prefetch_tensor_if_large(inp, stream_idx=3)'''
+        #print(outputs)
+        #print("===================================================================")
+        #compute_stream = torch.cuda.current_stream()
+        '''i=0
+        for out in outputs:
+            for x in out:
+                if torch.is_tensor(x):
+                    prefetch_tensor_if_large(x, stream_idx=i%8)
+                    i=i+1'''
+
+
+        '''i=0
+        #torch._C._cuda_endUvmAllocate()
+        #if layer_idx>=1 and output_modules[layer_idx-1]() is not None:
+        for out in outputs:
+            if torch.is_tensor(out):
+                    #print(out)
+                    #print("*****************")
+                
+                #packed = out.clone()
+                #packed.resize_(0)
+                #out.data=packed
+                
+
+                
+                
+                prefetch_tensor_if_large(out, stream_idx=i%4)
+                i=i+1'''
+        if layer_idx <=0:
+            return
+        torch._C._cuda_endUvmAllocate()
+        #if layer_idx>=1 and output_modules[layer_idx-1]() is not None:
+        for out in output_modules[layer_idx-1]():
+            if torch.is_tensor(out):
+                    #print(out)
+                    #print("*****************")
+                #check=out
+                packed = torch.empty_like(out) 
+                packed.copy_(out,non_blocking=True)
+                #packed.resize_(0)
+                out.data=packed
+                #check.resize_(0)
+        torch._C._cuda_beginUvmAllocate()
+        #torch._C._cuda_beginUvmAllocate()               
+        #time.sleep(3)
+        #for s in streams:
+        #    compute_stream.wait_stream(s)
+        '''if layer_idx == total_layers-1:
+            pass
+            
+        
+        next_idx = layer_idx + PREFETCH_LAYERS_AHEAD
+        if next_idx < total_layers:
+            next_layer = model_modules[next_idx]
+            if hasattr(next_layer, "weight"):
+                w = getattr(next_layer, "weight", None)
+                if w is not None and torch.is_tensor(w):
+                    stream_id = 2 + (next_idx % (len(streams) - 2))
+                    prefetch_tensor_if_large(w, stream_idx=stream_id)'''
+        
+        sub_module.applied_pre_backward_ref_cnt -= 1
+
+
 
 
 # ---------------- Forward Prefetch Hook ----------------
 model_modules = None
-
+output_modules = []
 def hook(module, input, output=None, layer_idx=None, total_layers=None):
     for inp in input:
         if torch.is_tensor(inp):
@@ -488,9 +561,11 @@ def hook(module, input, output=None, layer_idx=None, total_layers=None):
                     prefetch_tensor_if_large(w, stream_idx=stream_id)
 
 def hook_only_act(module, input, output=None, layer_idx=None, total_layers=None):
+    i=0
     for inp in input:
         if torch.is_tensor(inp):
-            prefetch_tensor_if_large(inp, stream_idx=3)
+            prefetch_tensor_if_large(inp, stream_idx=i%4)
+            i=i+1
 
 
 
@@ -572,12 +647,12 @@ class StepTimeCallback(TrainerCallback):
     
     
     def on_optimizer_step(self, args, state, control, **kwargs):
-        if self.is_nvtx :
+        if self.is_nvtx and False :
             torch.cuda.nvtx.range_pop()
 
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        if self.is_nvtx :
+        if self.is_nvtx and False:
             torch.cuda.nvtx.range_push(f"Step {state.global_step} - Optimizer")
 
 
@@ -593,17 +668,13 @@ class StepTimeCallback(TrainerCallback):
         self.step_times.append(duration)
         max_mem = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems.append(max_mem)
-        #torch._C._cuda_endUvmAllocate()
+        torch._C._cuda_endUvmAllocate()
         max_mem_pinned = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems_pinned.append(max_mem_pinned)
-        #torch._C._cuda_beginUvmAllocate()
+        torch._C._cuda_beginUvmAllocate()
         
         print(f"[Step {state.global_step}] {duration:.3f} sec | Max GPU Mem: {max_mem:.2f} MB | Max Pinned GPU Mem: {max_mem_pinned:.2f} MB" )
         torch.cuda.reset_peak_memory_stats()
-        
-        #if state.global_step==2:
-        #    torch._C._accelerator_disablePrefetch()
-        
         with _offload_lock:
             _offloaded_bytes = 0
 
@@ -657,11 +728,42 @@ def register_multi_layer_hooks(model,prefetch_weights=False, N=1,prefetch_weight
             module.register_forward_pre_hook(partial(hook_only_act, layer_idx=i, total_layers=total))
 def register_backward_hook(model):
     global model_modules
-    model_modules = list(model.modules())
+    global output_modules
+    if not model_modules:
+        model_modules = list(model.modules())
+        model_modules=[m for m in model_modules if hasattr(m, "weight")] 
+    #model_modules = list(model.modules())
     total = len(model_modules)
     #add_pre_backward_hook(model)
-    for name, module in model.named_modules():
-        add_pre_backward_hook(module,name)
+    for i, module in enumerate(model_modules):
+        class PreBackwardFunctionForModule(torch.autograd.Function):
+
+            @staticmethod
+            def forward(ctx, outputs,inputs):
+                # Capture `module` and _run_before_backward_function
+                ctx.module = module
+                #ctx.inputs=inputs
+                ctx.outputs=outputs
+                output_modules.append(weakref.ref(outputs))
+                ctx.pre_backward_function = _run_before_backward_function
+                if not hasattr(ctx.module, "applied_pre_backward_ref_cnt"):
+                    ctx.module.applied_pre_backward_ref_cnt = 0
+                ctx.module.applied_pre_backward_ref_cnt += 1
+                '''for out in outputs:
+                    if torch.is_tensor(out):
+                        prefetch_tensor_if_large(out, stream_idx=3)'''
+                return outputs
+
+            @staticmethod
+            def backward(ctx, *args):
+                #inputs=ctx.inputs
+                outputs=ctx.outputs
+                ctx.pre_backward_function(ctx.module,i,total,outputs)
+                return *args,None
+
+        module.pre_bwd_fn = PreBackwardFunctionForModule
+
+        module.register_forward_hook(_pre_backward_module_hook)
 
 def log_model_weight(model):
     global weight_logger
@@ -698,7 +800,7 @@ def main():
     global streams
     global PREFETCH_LAYERS_AHEAD
     PREFETCH_LAYERS_AHEAD = args.prefetch_layers
-    streams = [torch.cuda.Stream().cuda_stream for _ in range(PREFETCH_LAYERS_AHEAD + 3)]
+    streams = [torch.cuda.Stream() for _ in range(PREFETCH_LAYERS_AHEAD + 3)]
     global _offloaded_bytes
 
     
@@ -962,18 +1064,32 @@ def main():
         )
 
     def nvtx_training_step(self, model, inputs, num_items_in_batch=None):
+        global output_modules
         model.train()
         inputs = self._prepare_inputs(inputs)
 
         with self.compute_loss_context_manager():
-            torch.cuda.nvtx.range_push(f"Step {self.state.global_step} - Forward")
+            #torch.cuda.nvtx.range_push(f"Step {self.state.global_step} - Forward")
             loss = self.compute_loss(model, inputs)
-            torch.cuda.nvtx.range_pop()
-
+            #torch.cuda.nvtx.range_pop()
+        torch._C._cuda_endUvmAllocate()
+        #if layer_idx>=1 and output_modules[layer_idx-1]() is not None:
+        for out in output_modules[len(output_modules)-1]():
+            if torch.is_tensor(out):
+                    #print(out)
+                    #print("*****************")
+                #check=out
+                packed = torch.empty_like(out) 
+                packed.copy_(out,non_blocking=False)
+                #packed.resize_(0)
+                out.data=packed
+                #check.resize_(0)
+        torch._C._cuda_beginUvmAllocate()
         # Backward pass
-        torch.cuda.nvtx.range_push(f"Step {self.state.global_step} - Backward")
+        #torch.cuda.nvtx.range_push(f"Step {self.state.global_step} - Backward")
         self.accelerator.backward(loss)
-        torch.cuda.nvtx.range_pop()
+        output_modules=[]
+        #torch.cuda.nvtx.range_pop()
         #print("hello")
         torch.cuda.synchronize()
 
@@ -1110,8 +1226,15 @@ def main():
 if __name__ == "__main__":
     
     torch._C._cuda_beginUvmAllocate()
-    #torch._C._accelerator_enablePrefetch()
     torch.cuda.set_device('cuda:0')
+    # 24 GB in bytes
+    '''bytes_24g = 24 * 1024**3
+
+    # float32 = 4 bytes
+    num_elements = bytes_24g // 4
+
+    # Create 1D tensor
+    tensor = torch.zeros(num_elements, dtype=torch.float32, device="cuda")'''
     main()
     my_lib.print_first_byte()
     torch._C._cuda_endUvmAllocate()

@@ -24,7 +24,7 @@ import csv
 import argparse
 import re
 import logging
-
+from torch.profiler import profile, record_function, ProfilerActivity
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
@@ -593,10 +593,10 @@ class StepTimeCallback(TrainerCallback):
         self.step_times.append(duration)
         max_mem = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems.append(max_mem)
-        #torch._C._cuda_endUvmAllocate()
+        torch._C._cuda_endUvmAllocate()
         max_mem_pinned = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems_pinned.append(max_mem_pinned)
-        #torch._C._cuda_beginUvmAllocate()
+        torch._C._cuda_beginUvmAllocate()
         
         print(f"[Step {state.global_step}] {duration:.3f} sec | Max GPU Mem: {max_mem:.2f} MB | Max Pinned GPU Mem: {max_mem_pinned:.2f} MB" )
         torch.cuda.reset_peak_memory_stats()
@@ -1053,8 +1053,12 @@ def main():
             trainer.train()
     else:
         with torch.autograd.graph.saved_tensors_hooks(pack_hook_logging, unpack_hook):
-            
+            torch.cuda.nvtx.range_push(f"Training")
+            with record_function("Training"):
+                x = torch.randn((1,2), dtype=torch.float32)
+                del x 
             trainer.train()
+            torch.cuda.nvtx.range_pop()
             
 
     #print("Training end")
@@ -1112,6 +1116,26 @@ if __name__ == "__main__":
     torch._C._cuda_beginUvmAllocate()
     #torch._C._accelerator_enablePrefetch()
     torch.cuda.set_device('cuda:0')
-    main()
+    
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        main()
+    
+    with open('profiler_results_1.csv', mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+    # Header row
+        writer.writerow(['Event Name', 'Start Time (us)', 'End Time (us)', 'Duration (us)', 'Device'])
+
+        for evt in prof.events():
+            # prof.events() provides the raw timeline data
+            name = evt.name
+            start = evt.time_range.start
+            end = evt.time_range.end
+            duration = end - start
+            device = str(evt.device_type)
+
+            writer.writerow([name, start, end, duration, device])
+    
+    
+    
     my_lib.print_first_byte()
     torch._C._cuda_endUvmAllocate()

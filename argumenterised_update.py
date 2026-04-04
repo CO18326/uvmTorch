@@ -24,7 +24,7 @@ import csv
 import argparse
 import re
 import logging
-
+import deepspeed
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
@@ -214,10 +214,8 @@ def parse_args():
 
     parser.add_argument(
         "--hf_token",type=str,
-        default=None,help="hugging_face_token"
+        default="",help="hugging_face_token"
     )
-    
-    parser.add_argument("--gradient_checkpointing",type=int,default=0,help="gradient_checkpointing")
     
     parser.add_argument(
         "--build_csv",type=float,
@@ -229,11 +227,8 @@ def parse_args():
     parser.add_argument("--nvtx_inject",type=int,default=0,help="NVTX Inject")
 
     parser.add_argument("--csv_directory",type=str,default=".",help="csv directory")
-
-    parser.add_argument("--heuristic",type=int,default=0,help="use heuristic to abopt optimisation")
-
-    
-
+    parser.add_argument("--local_rank",type=int,default=0,help="local rank")
+    parser = deepspeed.add_config_arguments(parser)
 
     return parser.parse_args()
 
@@ -261,74 +256,6 @@ gradient_logger=None
 streams=None
 PREFETCH_LAYERS_AHEAD=1
 #---------------------------------------------------------------------------------------------
-
-
-def get_swappiness():
-    with open("/proc/sys/vm/swappiness", "r") as f:
-        return int(f.read().strip())
-
-
-def get_cpu_ram():
-    meminfo = {}
-    with open("/proc/meminfo") as f:
-        for line in f:
-            key, val = line.split(":")
-            meminfo[key] = int(val.strip().split()[0])  # kB
-
-    total_mb = meminfo["MemTotal"] / (1024)
-    avail_mb = meminfo["MemAvailable"] / (1024)
-
-    return total_mb, avail_mb
-
-def choose_optimisation(
-    optimizer_mem,
-    gpu_mem,
-    peak_mem,
-    oversubscription,
-    act_mem,
-    weight_mem,
-    disk_swap_after_offload,
-    args,
-    swapiness,
-    cpu_ram,
-    oversub_low,
-    act_mem_medium,
-    weight_mem_medium
-):
-    remaining_gpu_mem = peak_mem-gpu_mem
-
-    if remaining_gpu_mem <= 0.4 * optimizer_mem:
-        return "Vanilla"
-
-    print(cpu_ram,swapiness,peak_mem,gpu_mem,remaining_gpu_mem)
-    if not  (((remaining_gpu_mem - optimizer_mem)+2*optimizer_mem)+2*weight_mem > cpu_ram*(1-swapiness/200)) :
-
-        if oversubscription <= oversub_low:
-            args.optimiser_offload=1
-            args.prefetching=1
-            return "Optimiser offload + prefetch"
-
-        elif act_mem/gpu_mem <= act_mem_medium:
-            args.optimiser_offload=1
-            return "Optimiser offload"
-
-        else:
-            if weight_mem/gpu_mem <= weight_mem_medium  :
-                args.weight_pinned=1
-                return "Weight pin"
-            else:
-                return "Vanilla"
-
-    else:
-        if weight_mem/gpu_mem <= weight_mem_medium:
-            args.weight_pinned=1
-            return "Weight pin"
-        else:
-            return "Vanilla"
-
-
-
-
 def create_loggers(log_dir="logs_allocation_flexible"):
     global weight_logger
     global input_logger
@@ -572,12 +499,12 @@ class StepTimeCallback(TrainerCallback):
     
     
     def on_optimizer_step(self, args, state, control, **kwargs):
-        if self.is_nvtx :
+        if self.is_nvtx:
             torch.cuda.nvtx.range_pop()
 
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        if self.is_nvtx :
+        if self.is_nvtx:
             torch.cuda.nvtx.range_push(f"Step {state.global_step} - Optimizer")
 
 
@@ -600,10 +527,6 @@ class StepTimeCallback(TrainerCallback):
         
         print(f"[Step {state.global_step}] {duration:.3f} sec | Max GPU Mem: {max_mem:.2f} MB | Max Pinned GPU Mem: {max_mem_pinned:.2f} MB" )
         torch.cuda.reset_peak_memory_stats()
-        
-        #if state.global_step==2:
-        #    torch._C._accelerator_disablePrefetch()
-        
         with _offload_lock:
             _offloaded_bytes = 0
 
@@ -750,10 +673,21 @@ def main():
         ).cuda(0)
     
     #print_memory_prediction(model, batch_size, seq_len, bf16=True, safety=1.5)
+    if logging:
+        log_model_weight(model)
+    if prefetching:
+        register_multi_layer_hooks(model,True,PREFETCH_LAYERS_AHEAD)
+    if args.prefetch_weights_only:
+        register_multi_layer_hooks(model,False,PREFETCH_LAYERS_AHEAD,True)
+    if backward_prefetch:
+        register_backward_hook(model)
+    if activation_prefetch:
+        register_multi_layer_hooks(model,False)
+    if optimisation==2:
+        attach_hooks_by_type(model,args.num_layer_pinned)
     
     
-    
-    is_nvtx=True if args.nvtx_inject  else False
+    is_nvtx=True if args.nvtx_inject else False
     callbacks=[StepTimeCallback(is_nvtx),OptStateLoggerCallback() ] if logging else [StepTimeCallback(is_nvtx)]
     
     
@@ -768,7 +702,6 @@ def main():
             logging_steps=1,
             save_strategy="no",
             report_to="none",
-            gradient_checkpointing=args.gradient_checkpointing
         )
 
         
@@ -776,7 +709,7 @@ def main():
                 model=model,
                 args=training_args,
                 train_dataset=dataset,
-                processing_class=tokenizer,
+                tokenizer=tokenizer,
                 data_collator=data_collator,
                 callbacks=[callbacks[0]],
             
@@ -831,32 +764,6 @@ def main():
         print(f"Optimizer Memory : {human_readable_mb(optim_b)}")
         print(f"Activation Memory: {human_readable_mb(activation_b)}")
         print("================================================\n")
-    
-    
-    
-    
-    
-    
-    if args.heuristic :
-        
-        swapiness=get_swappiness()
-        cpu_ram=get_cpu_ram()[0]
-        heuristic_prediction=choose_optimisation(optim_b,total_memory,peak_mem*(1024**2),achieved_oversubscription_factor,activation_b
-                            ,param_b,False,args,swapiness,cpu_ram*1024*1024,2.0,37,0.3)
-        print(f"HEURISTIC PreDICTION+++++++    {heuristic_prediction}")
-        if args.weight_pinned:
-            model.to("cpu")   # optional but helps fragmentation
-            del model
-            import gc
-            gc.collect()
-            torch._C._cuda_endUvmAllocate()
-            model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16,token=args.hf_token
-            ).cuda(0)
-            torch._C._cuda_beginUvmAllocate()
-
-    
-    
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     
@@ -864,52 +771,18 @@ def main():
     callbacks[0].peak_mems=[]
     callbacks[0].peak_mems_pinned=[]
     
-    
-    '''if args.weight_pinned:
-        torch._C._cuda_endUvmAllocate()
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16,token=args.hf_token
-        ).cuda(0)
-        torch._C._cuda_beginUvmAllocate()
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16,token=args.hf_token
-        ).cuda(0)'''
-    
-    
-    optimisation= args.optimisation
-    prefetching = args.prefetching
-    activation_prefetch = args.activation_prefetch
-    logging=args.logging
-    backward_prefetch=args.backward_prefetch
-    
-    if logging:
-        log_model_weight(model)
-    if prefetching:
-        register_multi_layer_hooks(model,True,PREFETCH_LAYERS_AHEAD)
-    if args.prefetch_weights_only:
-        register_multi_layer_hooks(model,False,PREFETCH_LAYERS_AHEAD,True)
-    if backward_prefetch:
-        register_backward_hook(model)
-    if activation_prefetch:
-        register_multi_layer_hooks(model,False)
-    if optimisation==2:
-        attach_hooks_by_type(model,args.num_layer_pinned)
-    
-    
-    
-    
     training_args = TrainingArguments(
         output_dir="./results",
         per_device_train_batch_size=batch_size,
         num_train_epochs=1,
         max_steps=steps,
         bf16=True,
+        deepspeed="./deep_config.json",
         logging_dir="./logs",
         logging_steps=1,
         save_strategy="no",
         report_to="none",
-        gradient_checkpointing=args.gradient_checkpointing
+        gradient_checkpointing=True
     )
 
     optimizer = ds_opt(model.parameters(), lr=1e-5)
@@ -930,7 +803,7 @@ def main():
             model=model,
             args=training_args,
             train_dataset=dataset,
-            processing_class=tokenizer,
+            tokenizer=tokenizer,
             data_collator=data_collator,
             callbacks=callbacks,
             optimizers=(optimizer, None),
@@ -943,7 +816,7 @@ def main():
             model=model,
             args=training_args,
             train_dataset=dataset,
-            processing_class=tokenizer,
+            tokenizer=tokenizer,
             data_collator=data_collator,
             callbacks=callbacks,
             optimizers=(optimizer, None),
@@ -955,12 +828,11 @@ def main():
             model=model,
             args=training_args,
             train_dataset=dataset,
-            processing_class=tokenizer,
+            tokenizer=tokenizer,
             data_collator=data_collator,
-            callbacks=callbacks,
+            callbacks=callbacks
         
         )
-
     def nvtx_training_step(self, model, inputs, num_items_in_batch=None):
         model.train()
         inputs = self._prepare_inputs(inputs)
@@ -1031,7 +903,7 @@ def main():
     def build_csv_name(args):
         parts = []
         for k, v in vars(args).items():
-            if k == "oversubscription_factor" or k=="no_warmup" or k=="nvtx_inject" or k=="hf_token" or k=="csv_directory" or k=="heuristic":
+            if k == "oversubscription_factor" or k=="no_warmup" or k=="nvtx_inject" or k=="hf_token" or k=="csv_directory":
                 continue
             if v is None:
                 continue
@@ -1092,7 +964,7 @@ def main():
 
     if args.build_csv :
     
-        csv_name = f"{args.csv_directory}/{build_csv_name(args)}"
+        csv_name = f"{args.csv_directory}/deepspeed_stage3_{build_csv_name(args)}"
 
         header = "avg_step_time,peak_gpu_mem,peak_gpu_mem_pinned,weights_mem,grads_mem,opt_mem,activation_mem,oversub_factor,available_gpu_mem\n"
         row = f"{avg_step:.4f},{peak_mem:.2f},{peak_mems_pinned:.2f},{human_readable_mb(param_b)},{human_readable_mb(grad_b)},{human_readable_mb(optim_b)},{human_readable_mb(activation_b)},{final_oversubscription:.2f},{final_gpu_mem:.2f}\n"
@@ -1109,9 +981,8 @@ def main():
 
 if __name__ == "__main__":
     
-    torch._C._cuda_beginUvmAllocate()
-    #torch._C._accelerator_enablePrefetch()
+    #torch._C._cuda_beginUvmAllocate()
     torch.cuda.set_device('cuda:0')
     main()
-    my_lib.print_first_byte()
-    torch._C._cuda_endUvmAllocate()
+    #my_lib.print_first_byte()
+    #torch._C._cuda_endUvmAllocate()

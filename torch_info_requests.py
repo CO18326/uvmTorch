@@ -33,3 +33,12 @@ model_summary = summary(
 
 
 print(model)
+
+
+
+
+
+
+import torch.fx as fx
+graph = fx.symbolic_trace(model)
+print(graph.graph)

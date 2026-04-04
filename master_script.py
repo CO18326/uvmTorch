@@ -1,13 +1,13 @@
 import subprocess
 import argparse
 
-SEQ_LIST = [512,650,720,820]
-BATCH_LIST = [8]
+SEQ_LIST = [2048,3000,3600]
+BATCH_LIST = [4]
 
 def run_once(python_script, fixed_args, batch, seq):
     """Run training script once with batch + seq."""
     cmd = [
-        "python", python_script,
+        "python",python_script,
         "--batch_size", str(batch),
         "--seq_len", str(seq),
     ] + fixed_args

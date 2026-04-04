@@ -459,8 +459,10 @@ def attach_hooks_by_type(model,num_layer):
 
 # ---------------- Forward Prefetch Hook ----------------
 model_modules = None
+act_ref={}
 
 def hook(module, input, output=None, layer_idx=None, total_layers=None):
+    act_ref[layer_idx]=[weakref.ref(x) for x in input if torch.is_tensor(x)]
     for inp in input:
         if torch.is_tensor(inp):
             prefetch_tensor_if_large(inp, stream_idx=3)
@@ -554,6 +556,39 @@ def add_pre_backward_hook(module,name):
 
     module.register_forward_hook(fw_hook)
 
+def backward_pre_hook(index):
+    def hook(module, grad_outputs):
+        #input=act_ref[index]()
+        for idx, (name, p) in enumerate(module.named_parameters()):
+            i=0
+            if "v_proj" in name:
+                for inp in grad_outputs:
+                    if torch.is_tensor(inp):
+                        prefetch_tensor_if_large(inp, stream_idx=i%4)
+                        i=i+1
+            
+
+    return hook
+
+
+
+def register_module_backward_hook(index):
+    #if 'mlp' in name:
+    model_modules[index].register_full_backward_pre_hook(backward_pre_hook(index))
+
+
+
+def add_pre_backward_hook_v2(model):
+    global model_modules
+    #model.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total)) if prefetch_weights else model.register_forward_pre_hook(partial(hook_only_act, layer_idx=i, total_layers=total))
+    model_modules = list(model.modules())
+    model_modules=[m for m in model_modules if hasattr(m, "weight") ]
+    for i,model in enumerate(model_modules):
+        register_module_backward_hook(i)
+
+
+
+
 
 _offload_lock = threading.Lock()
 _offloaded_bytes = 0
@@ -593,17 +628,13 @@ class StepTimeCallback(TrainerCallback):
         self.step_times.append(duration)
         max_mem = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems.append(max_mem)
-        #torch._C._cuda_endUvmAllocate()
+        torch._C._cuda_endUvmAllocate()
         max_mem_pinned = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems_pinned.append(max_mem_pinned)
-        #torch._C._cuda_beginUvmAllocate()
+        torch._C._cuda_beginUvmAllocate()
         
         print(f"[Step {state.global_step}] {duration:.3f} sec | Max GPU Mem: {max_mem:.2f} MB | Max Pinned GPU Mem: {max_mem_pinned:.2f} MB" )
         torch.cuda.reset_peak_memory_stats()
-        
-        #if state.global_step==2:
-        #    torch._C._accelerator_disablePrefetch()
-        
         with _offload_lock:
             _offloaded_bytes = 0
 
@@ -890,7 +921,8 @@ def main():
     if args.prefetch_weights_only:
         register_multi_layer_hooks(model,False,PREFETCH_LAYERS_AHEAD,True)
     if backward_prefetch:
-        register_backward_hook(model)
+        #register_backward_hook(model)
+        add_pre_backward_hook_v2(model)
     if activation_prefetch:
         register_multi_layer_hooks(model,False)
     if optimisation==2:
@@ -1110,7 +1142,6 @@ def main():
 if __name__ == "__main__":
     
     torch._C._cuda_beginUvmAllocate()
-    #torch._C._accelerator_enablePrefetch()
     torch.cuda.set_device('cuda:0')
     main()
     my_lib.print_first_byte()

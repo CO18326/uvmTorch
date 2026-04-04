@@ -24,10 +24,13 @@ import csv
 import argparse
 import re
 import logging
-
+import os, shutil
+from experiment.index_tensor import DataInspectorMode
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
+CURRENT_STEP=0
+mode=DataInspectorMode()
 #--------------------------------------------------Memory------------------------------------------------------
 def human_readable_mb(x_bytes):
     mb = x_bytes / (1024 ** 2)
@@ -231,6 +234,8 @@ def parse_args():
     parser.add_argument("--csv_directory",type=str,default=".",help="csv directory")
 
     parser.add_argument("--heuristic",type=int,default=0,help="use heuristic to abopt optimisation")
+
+    parser.add_argument("--intensive_logging",type=int, default=0,help="intensive logging" )
 
     
 
@@ -586,6 +591,8 @@ class StepTimeCallback(TrainerCallback):
     
     def on_step_begin(self, args, state, control, **kwargs):
         self.start = time.time()
+        global CURRENT_STEP
+        CURRENT_STEP = state.global_step
     def on_step_end(self, args, state, control, **kwargs):
         global _offloaded_bytes
         torch.cuda.synchronize()
@@ -593,17 +600,13 @@ class StepTimeCallback(TrainerCallback):
         self.step_times.append(duration)
         max_mem = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems.append(max_mem)
-        #torch._C._cuda_endUvmAllocate()
+        torch._C._cuda_endUvmAllocate()
         max_mem_pinned = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems_pinned.append(max_mem_pinned)
-        #torch._C._cuda_beginUvmAllocate()
+        torch._C._cuda_beginUvmAllocate()
         
         print(f"[Step {state.global_step}] {duration:.3f} sec | Max GPU Mem: {max_mem:.2f} MB | Max Pinned GPU Mem: {max_mem_pinned:.2f} MB" )
         torch.cuda.reset_peak_memory_stats()
-        
-        #if state.global_step==2:
-        #    torch._C._accelerator_disablePrefetch()
-        
         with _offload_lock:
             _offloaded_bytes = 0
 
@@ -655,6 +658,152 @@ def register_multi_layer_hooks(model,prefetch_weights=False, N=1,prefetch_weight
 
         else:
             module.register_forward_pre_hook(partial(hook_only_act, layer_idx=i, total_layers=total))
+
+
+
+BASE_DIR = "logs"
+os.makedirs(BASE_DIR, exist_ok=True)
+
+
+def tensor_info(t):
+    return f"addr={hex(t.data_ptr())} shape={tuple(t.shape)} bytes={t.numel()*t.element_size()} device={t.device}\n"
+
+
+def write_tensor(file, tensors):
+    if not isinstance(tensors, (tuple, list)):
+        tensors = (tensors,)
+
+    with open(file, "a") as f:
+        for t in tensors:
+            if isinstance(t, torch.Tensor):
+                f.write(tensor_info(t))
+
+
+# ----------------------
+# Hooks
+# ----------------------
+
+def forward_pre_hook(name):
+
+    def hook(module, inputs):
+        step_dir = os.path.join(BASE_DIR, f"step_{CURRENT_STEP}")
+        module_dir = os.path.join(step_dir, name)
+        os.makedirs(module_dir, exist_ok=True)
+
+        write_tensor(os.path.join(module_dir, "forward_inputs.txt"), inputs)
+
+        for pname, p in module.named_parameters(recurse=False):
+            with open(os.path.join(module_dir, "weights.txt"), "a") as f:
+                f.write(f"{pname} {tensor_info(p)}")
+        
+
+        torch.cuda.nvtx.range_push(f"step_{CURRENT_STEP}_{name}_forward")
+
+    return hook
+
+def wrap_forward(module, name):
+
+    old_forward = module.forward
+
+    def new_forward(*args, **kwargs):
+
+        range_name = f"step_{CURRENT_STEP}_{name}_forward"
+        torch.cuda.nvtx.range_push(range_name)
+
+        out = old_forward(*args, **kwargs)
+
+        torch.cuda.nvtx.range_pop()
+
+        return out
+
+    module.forward = new_forward
+
+
+
+
+def forward_hook(name):
+
+    def hook(module, inputs, outputs):
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        step_dir = os.path.join(BASE_DIR, f"step_{CURRENT_STEP}")
+        module_dir = os.path.join(step_dir, name)
+        write_tensor(os.path.join(module_dir, "forward_outputs.txt"), outputs)
+        
+
+        move = lambda src, base: shutil.move(src, next(f"{base}_{i}.csv" if os.path.exists(f"{base}.csv" if i==0 else f"{base}_{i}.csv") else (f"{base}.csv" if i==0 else f"{base}_{i}.csv") for i in range(1000)))
+        if os.path.exists("allocation.csv") :
+            move("allocation.csv", f"step_{CURRENT_STEP}_{name}_forward_allocation")
+        if os.path.exists("free.csv") :
+            move("free.csv", f"step_{CURRENT_STEP}_{name}_forward_free")
+        
+        #open("allocation.csv", "w").close()
+        #open("free.csv", "w").close()
+
+    return hook
+
+
+def backward_pre_hook(name):
+
+    def hook(module, grad_outputs):
+        step_dir = os.path.join(BASE_DIR, f"step_{CURRENT_STEP}")
+        module_dir = os.path.join(step_dir, name)
+        write_tensor(os.path.join(module_dir, "backward_grad_outputs.txt"), grad_outputs)
+        torch.cuda.nvtx.range_push(f"step_{CURRENT_STEP}_{name}_backward")
+
+    return hook
+
+
+def get_time_ns():
+    return time.time_ns()
+
+def backward_hook(name):
+
+    def hook(module, grad_inputs, grad_outputs):
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        step_dir = os.path.join(BASE_DIR, f"step_{CURRENT_STEP}")
+        module_dir = os.path.join(step_dir, name)
+
+        write_tensor(os.path.join(module_dir, "backward_grad_inputs.txt"), grad_inputs)
+        write_tensor(os.path.join(module_dir, "backward_grad_outputs.txt"), grad_outputs)
+
+        move = lambda src, base: shutil.move(src, next(f"{base}_{i}.csv" if os.path.exists(f"{base}.csv" if i==0 else f"{base}_{i}.csv") else (f"{base}.csv" if i==0 else f"{base}_{i}.csv") for i in range(1000)))
+
+        if os.path.exists("allocation.csv") :
+            move("allocation.csv", f"step_{CURRENT_STEP}_{name}_backward_allocation")
+        if os.path.exists("free.csv") :
+            move("free.csv", f"step_{CURRENT_STEP}_{name}_backward_free")
+        open("allocation.csv", "w").close()
+        open("free.csv", "w").close()
+
+    return hook
+
+
+
+
+
+def register_intensive_logging_hooks(model):
+    global model_modules
+    #model.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total)) if prefetch_weights else model.register_forward_pre_hook(partial(hook_only_act, layer_idx=i, total_layers=total))
+    model_modules = list(model.named_modules())
+    model_modules=[(n,m) for n,m in model_modules if hasattr(m, "weight") ]
+    
+    
+    total = len(model_modules)
+    for name, module in model_modules:
+        
+        
+        
+        safe_name = name.replace(".", "_")
+        #wrap_forward(module, safe_name)
+        module.register_forward_pre_hook(forward_pre_hook(safe_name))
+        module.register_forward_hook(forward_hook(safe_name))
+
+        module.register_full_backward_pre_hook(backward_pre_hook(safe_name))
+        module.register_full_backward_hook(backward_hook(safe_name))
+
+
 def register_backward_hook(model):
     global model_modules
     model_modules = list(model.modules())
@@ -691,6 +840,9 @@ def build_log_dir_name(args):
         
     filename = "-".join(parts)
     return filename
+
+
+
 
 
 def main():
@@ -879,6 +1031,7 @@ def main():
     
     optimisation= args.optimisation
     prefetching = args.prefetching
+    intensive_logging=args.intensive_logging
     activation_prefetch = args.activation_prefetch
     logging=args.logging
     backward_prefetch=args.backward_prefetch
@@ -895,7 +1048,8 @@ def main():
         register_multi_layer_hooks(model,False)
     if optimisation==2:
         attach_hooks_by_type(model,args.num_layer_pinned)
-    
+    if intensive_logging:
+        register_intensive_logging_hooks(model)
     
     
     
@@ -1052,10 +1206,13 @@ def main():
         with torch.autograd.graph.saved_tensors_hooks(pack_hook_layer, unpack_hook):
             trainer.train()
     else:
-        with torch.autograd.graph.saved_tensors_hooks(pack_hook_logging, unpack_hook):
-            
-            trainer.train()
-            
+        with mode:
+            with torch.autograd.graph.saved_tensors_hooks(pack_hook_logging, unpack_hook):
+                
+                print("training begning time : ",get_time_ns())
+                torch.cuda.nvtx.range_push(f"Training")
+                trainer.train()
+                torch.cuda.nvtx.range_pop()
 
     #print("Training end")
     cb = callbacks[0]

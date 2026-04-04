@@ -593,10 +593,10 @@ class StepTimeCallback(TrainerCallback):
         self.step_times.append(duration)
         max_mem = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems.append(max_mem)
-        #torch._C._cuda_endUvmAllocate()
+        torch._C._cuda_endUvmAllocate()
         max_mem_pinned = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems_pinned.append(max_mem_pinned)
-        #torch._C._cuda_beginUvmAllocate()
+        torch._C._cuda_beginUvmAllocate()
         
         print(f"[Step {state.global_step}] {duration:.3f} sec | Max GPU Mem: {max_mem:.2f} MB | Max Pinned GPU Mem: {max_mem_pinned:.2f} MB" )
         torch.cuda.reset_peak_memory_stats()
@@ -638,7 +638,38 @@ class OptStateLoggerCallback(TrainerCallback):
         if state.global_step==1:
             log_optimizer_state_addresses(opt)
             
+def backward_pre_hook(layer_idx):
 
+    def hook(module, grad_outputs):
+        for inp in grad_outputs:
+            if torch.is_tensor(inp):
+                prefetch_tensor_if_large(inp, stream_idx=3)
+        
+
+        global model_modules
+        total_layers = len(model_modules)
+        if model_modules is None or total_layers is None or layer_idx is None:
+            return
+        if layer_idx == total_layers-1:
+            end = max(PREFETCH_LAYERS_AHEAD, total_layers)
+            for j in range(end):
+                next_layer = model_modules[j]
+                if hasattr(next_layer, "weight"):
+                    w = getattr(next_layer, "weight", None)
+                    if w is not None and torch.is_tensor(w):
+                        stream_id = 2 + (j % (len(streams) - 2))
+                        prefetch_tensor_if_large(w, stream_idx=stream_id)
+        else:
+            next_idx = layer_idx - PREFETCH_LAYERS_AHEAD
+            if next_idx < total_layers:
+                next_layer = model_modules[next_idx]
+                if hasattr(next_layer, "weight"):
+                    w = getattr(next_layer, "weight", None)
+                    if w is not None and torch.is_tensor(w):
+                        stream_id = 2 + (next_idx % (len(streams) - 2))
+                        prefetch_tensor_if_large(w, stream_idx=stream_id)
+
+    return hook
 
 def register_multi_layer_hooks(model,prefetch_weights=False, N=1,prefetch_weights_only=False):
     global model_modules
@@ -648,7 +679,9 @@ def register_multi_layer_hooks(model,prefetch_weights=False, N=1,prefetch_weight
     total = len(model_modules)
     for i, module in enumerate(model_modules):
         if prefetch_weights:
-            module.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total))  
+            module.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total))
+            module.register_full_backward_pre_hook(backward_pre_hook(i))
+            #module.register_full_backward_hook(backward_hook(safe_name))  
         
         elif prefetch_weights_only:
             module.register_forward_pre_hook(partial(hook_only_weights, layer_idx=i, total_layers=total))
@@ -1110,7 +1143,7 @@ def main():
 if __name__ == "__main__":
     
     torch._C._cuda_beginUvmAllocate()
-    #torch._C._accelerator_enablePrefetch()
+    torch._C._accelerator_enablePrefetch()
     torch.cuda.set_device('cuda:0')
     main()
     my_lib.print_first_byte()
