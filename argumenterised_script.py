@@ -1110,9 +1110,9 @@ def main():
 if __name__ == "__main__":
     
     torch._C._cuda_beginUvmAllocate()
-    torch._C._accelerator_enablePrefetch()
+    #torch._C._accelerator_enablePrefetch()
     torch.cuda.set_device('cuda:0')
-    print("hello")
+    #print("hello")
     main()
     my_lib.print_first_byte()
     torch._C._cuda_endUvmAllocate()
