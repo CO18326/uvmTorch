@@ -1,7 +1,7 @@
 import subprocess
 import argparse
 
-SEQ_LIST = [3600]
+SEQ_LIST = [32768]
 BATCH_LIST = [4]
 
 def run_once(python_script, fixed_args, batch, seq,profile_out):
